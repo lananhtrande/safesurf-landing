@@ -1,151 +1,42 @@
-name: CI/CD Pipeline (Build + Deploy)
+name: Frontend CI/CD (Vite → S3 + CloudFront)
 
 on:
   push:
+    paths:
+      - 'frontend/**'
     branches:
       - main
 
-env:
-  IMAGE_NAME: lananh03/safesurf-landing
-
 jobs:
-
-  # =========================
-  # 🧪 1. TEST STAGE
-  # =========================
-  test:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run basic tests
-        run: |
-          echo "Running tests..."
-          ls -la
-          # 👉 Replace with real tests later (npm test, etc.)
-
-  # =========================
-  # 🐳 2. BUILD & PUSH
-  # =========================
-  build:
-    needs: test
-    runs-on: ubuntu-latest
-
-    outputs:
-      image_tag: ${{ steps.meta.outputs.tag }}
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Generate image tag
-        id: meta
-        run: echo "tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
-
-      - name: Build and push image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-
-  # =========================
-  # 🚀 3. DEPLOY (BLUE/GREEN)
-  # =========================
   deploy:
-    needs: build
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: frontend
+
     steps:
-      - name: Deploy to EC2 via SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Vite app
+        run: npm run build
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-            set -e
+      - name: Upload to S3
+        run: |
+          aws s3 sync dist/ s3://safesurf-landing-s3-la --delete
 
-            IMAGE="${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
-            PREFIX="nginx"
-
-            echo "📥 Pulling image: $IMAGE"
-            docker pull $IMAGE
-
-            # Determine active container
-            if docker ps --format '{{.Names}}' | grep -q ${PREFIX}-blue; then
-              CURRENT="blue"
-              NEXT="green"
-            else
-              CURRENT="green"
-              NEXT="blue"
-            fi
-
-            echo "🔄 Current: $CURRENT → Deploying: $NEXT"
-
-            # Cleanup previous NEXT container if exists
-            docker rm -f ${PREFIX}-${NEXT} || true
-
-            # Start new container on temp ports
-            docker run -d \
-              --name ${PREFIX}-${NEXT} \
-              -p 8080:80 \
-              -p 8443:443 \
-              $IMAGE
-
-            echo "⏳ Waiting for health check..."
-
-            HEALTHY=false
-            for i in {1..10}; do
-              if curl -k https://localhost:8443 > /dev/null 2>&1; then
-                echo "✅ Health check passed"
-                HEALTHY=true
-                break
-              fi
-              echo "Retry $i..."
-              sleep 3
-            done
-
-            if [ "$HEALTHY" = true ]; then
-
-              echo "🚀 Promoting $NEXT to production"
-
-              docker stop ${PREFIX}-${CURRENT} || true
-              docker rm ${PREFIX}-${CURRENT} || true
-
-              docker stop ${PREFIX}-${NEXT}
-              docker rm ${PREFIX}-${NEXT}
-
-              docker run -d \
-                --name ${PREFIX}-${NEXT} \
-                -p 80:80 -p 443:443 \
-                $IMAGE
-
-              echo "🎉 Deployment successful: $NEXT is live"
-
-            else
-              echo "❌ Health check failed → rollback"
-
-              docker logs ${PREFIX}-${NEXT}
-
-              docker stop ${PREFIX}-${NEXT} || true
-              docker rm ${PREFIX}-${NEXT} || true
-
-              echo "🛑 Rollback complete (still running $CURRENT)"
-              exit 1
-            fi
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.DISTRIBUTION_ID }} \
+            --paths "/*"
