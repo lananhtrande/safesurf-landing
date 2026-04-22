@@ -2,10 +2,8 @@ name: Frontend CI/CD (Vite → S3 + CloudFront)
 
 on:
   push:
-    paths:
-      - 'frontend/**'
     branches:
-      - main
+      - '**'
 
 jobs:
   deploy:
